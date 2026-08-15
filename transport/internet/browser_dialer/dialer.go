@@ -20,6 +20,7 @@ import (
 var webpage []byte
 
 type task struct {
+	TaskID         string `json:"taskId"` // Unique ID to route the response connection
 	Method         string `json:"method"`
 	URL            string `json:"url"`
 	Extra          any    `json:"extra,omitempty"`
@@ -27,22 +28,22 @@ type task struct {
 }
 
 var (
-	conns       chan *websocket.Conn
 	server      *http.Server
 	currentAddr string
+	csrfToken   string
 	mu          sync.Mutex
+
+	// Single control connection for the active tab
+	controlConn *websocket.Conn
+
+	// Registry for in-flight tasks
+	pendingTasks map[string]chan *websocket.Conn
 )
 
 var upgrader = &websocket.Upgrader{
-	ReadBufferSize:   0,
-	WriteBufferSize:  0,
-	HandshakeTimeout: time.Second * 4,
-	CheckOrigin: func(r *http.Request) bool {
-		return true
-	},
+	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
-// Used by external projects when using xray as a go module
 func Reload() {
 	addr := platform.NewEnvFlag(platform.BrowserDialerAddress).GetValue(func() string { return "" })
 	mu.Lock()
@@ -56,36 +57,42 @@ func Reload() {
 		server.Close()
 		server = nil
 	}
-	if HasBrowserDialer() {
-		for len(conns) > 0 {
-			select {
-			case c := <-conns:
-				c.Close()
-			default:
-			}
-		}
-		conns = nil
+
+	if controlConn != nil {
+		controlConn.Close()
+		controlConn = nil
 	}
+
+	for id, ch := range pendingTasks {
+		close(ch)
+		delete(pendingTasks, id)
+	}
+
 	currentAddr = addr
 	if addr != "" {
 		token := uuid.New()
-		csrfToken := token.String()
-		webpage := bytes.ReplaceAll(webpage, []byte("csrfToken"), []byte(csrfToken))
-		conns = make(chan *websocket.Conn, 256)
+		csrfToken = token.String()
+		html := bytes.ReplaceAll(webpage, []byte("csrfToken"), []byte(csrfToken))
+		pendingTasks = make(map[string]chan *websocket.Conn)
+
 		server = &http.Server{
 			Addr: addr,
 			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path == "/websocket" {
-					if r.URL.Query().Get("token") == csrfToken {
-						if conn, err := upgrader.Upgrade(w, r, nil); err == nil {
-							conns <- conn
-						} else {
-							errors.LogError(context.Background(), "Browser dialer http upgrade unexpected error")
-						}
+					if r.URL.Query().Get("token") != csrfToken {
+						w.WriteHeader(http.StatusForbidden)
+						return
+					}
+
+					// Differentiate connection intent via query params on the single entry point
+					if r.URL.Query().Get("taskId") != "" {
+						handleDataConnection(w, r)
+					} else {
+						handleControlConnection(w, r)
 					}
 				} else {
 					w.Header().Set("Access-Control-Allow-Origin", "*")
-					w.Write(webpage)
+					w.Write(html)
 				}
 			}),
 		}
@@ -93,8 +100,64 @@ func Reload() {
 	}
 }
 
+func handleControlConnection(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		errors.LogError(context.Background(), "Browser dialer control upgrade error")
+		return
+	}
+
+	mu.Lock()
+	if controlConn != nil {
+		mu.Unlock()
+		// Another tab is already active. Drop this connection gracefully to trigger standby polling.
+		conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "standby"))
+		conn.Close()
+		return
+	}
+	controlConn = conn
+	mu.Unlock()
+
+	// Block here to monitor the active tab's connection health
+	for {
+		if _, _, err := conn.ReadMessage(); err != nil {
+			break
+		}
+	}
+
+	mu.Lock()
+	if controlConn == conn {
+		controlConn = nil
+	}
+	mu.Unlock()
+	conn.Close()
+}
+
+func handleDataConnection(w http.ResponseWriter, r *http.Request) {
+	taskID := r.URL.Query().Get("taskId")
+
+	mu.Lock()
+	ch, exists := pendingTasks[taskID]
+	if !exists {
+		mu.Unlock()
+		http.Error(w, "invalid or expired taskId", http.StatusNotFound)
+		return
+	}
+	delete(pendingTasks, taskID)
+	mu.Unlock()
+
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		close(ch)
+		return
+	}
+	ch <- conn // Pipe connection back to the waiting dialTask routine
+}
+
 func HasBrowserDialer() bool {
-	return conns != nil
+	mu.Lock()
+	defer mu.Unlock()
+	return controlConn != nil
 }
 
 type webSocketExtra struct {
@@ -106,12 +169,10 @@ func DialWS(uri string, ed []byte) (*websocket.Conn, error) {
 		Method:         "WS",
 		URL:            uri,
 		StreamResponse: true,
+		Extra: webSocketExtra{
+			Protocol: base64.RawURLEncoding.EncodeToString(ed),
+		},
 	}
-
-	task.Extra = webSocketExtra{
-		Protocol: base64.RawURLEncoding.EncodeToString(ed),
-	}
-
 	return dialTask(task)
 }
 
@@ -122,7 +183,7 @@ type httpExtra struct {
 }
 
 func httpExtraFromHeadersAndCookies(headers http.Header, cookies []*http.Cookie) *httpExtra {
-	if len(headers) == 0 {
+	if len(headers) == 0 && len(cookies) == 0 {
 		return nil
 	}
 
@@ -133,14 +194,14 @@ func httpExtraFromHeadersAndCookies(headers http.Header, cookies []*http.Cookie)
 	}
 
 	if len(headers) > 0 {
-		extra.Headers = make(map[string]string)
+		extra.Headers = make(map[string]string, len(headers))
 		for header := range headers {
 			extra.Headers[header] = headers.Get(header)
 		}
 	}
 
 	if len(cookies) > 0 {
-		extra.Cookies = make(map[string]string)
+		extra.Cookies = make(map[string]string, len(cookies))
 		for _, cookie := range cookies {
 			extra.Cookies[cookie.Name] = cookie.Value
 		}
@@ -156,15 +217,10 @@ func DialGet(uri string, headers http.Header, cookies []*http.Cookie) (*websocke
 		Extra:          httpExtraFromHeadersAndCookies(headers, cookies),
 		StreamResponse: true,
 	}
-
 	return dialTask(task)
 }
 
 func DialPacket(method string, uri string, headers http.Header, cookies []*http.Cookie, payload []byte) error {
-	return dialWithBody(method, uri, headers, cookies, payload)
-}
-
-func dialWithBody(method string, uri string, headers http.Header, cookies []*http.Cookie, payload []byte) error {
 	task := task{
 		Method:         method,
 		URL:            uri,
@@ -176,42 +232,58 @@ func dialWithBody(method string, uri string, headers http.Header, cookies []*htt
 	if err != nil {
 		return err
 	}
+	defer conn.Close()
 
-	err = conn.WriteMessage(websocket.BinaryMessage, payload)
-	if err != nil {
+	if err = conn.WriteMessage(websocket.BinaryMessage, payload); err != nil {
 		return err
 	}
 
-	err = CheckOK(conn)
-	if err != nil {
-		return err
-	}
-
-	conn.Close()
-	return nil
+	return CheckOK(conn)
 }
 
-func dialTask(task task) (*websocket.Conn, error) {
-	data, err := json.Marshal(task)
+func dialTask(t task) (*websocket.Conn, error) {
+	token := uuid.New()
+	t.TaskID = token.String()
+	data, err := json.Marshal(t)
 	if err != nil {
 		return nil, err
 	}
 
-	var conn *websocket.Conn
-	for {
-		conn = <-conns
-		if conn.WriteMessage(websocket.TextMessage, data) != nil {
-			conn.Close()
-		} else {
-			break
+	mu.Lock()
+	if controlConn == nil {
+		mu.Unlock()
+		return nil, errors.New("browser dialer is offline")
+	}
+
+	ch := make(chan *websocket.Conn, 1)
+	pendingTasks[t.TaskID] = ch
+
+	err = controlConn.WriteMessage(websocket.TextMessage, data)
+	mu.Unlock()
+
+	if err != nil {
+		mu.Lock()
+		delete(pendingTasks, t.TaskID)
+		mu.Unlock()
+		return nil, err
+	}
+
+	// Block until the specific JS Data task connection arrives
+	select {
+	case conn, ok := <-ch:
+		if !ok || conn == nil {
+			return nil, errors.New("failed to establish task data channel")
 		}
+		if err := CheckOK(conn); err != nil {
+			return nil, err
+		}
+		return conn, nil
+	case <-time.After(15 * time.Second):
+		mu.Lock()
+		delete(pendingTasks, t.TaskID)
+		mu.Unlock()
+		return nil, errors.New("browser dialer task timeout")
 	}
-	err = CheckOK(conn)
-	if err != nil {
-		return nil, err
-	}
-
-	return conn, nil
 }
 
 func CheckOK(conn *websocket.Conn) error {
@@ -220,9 +292,8 @@ func CheckOK(conn *websocket.Conn) error {
 		return err
 	} else if s := string(p); s != "ok" {
 		conn.Close()
-		return errors.New(s)
+		return errors.New("dialer error: " + s)
 	}
-
 	return nil
 }
 
